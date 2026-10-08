@@ -1,0 +1,5 @@
+#!/bin/zsh
+set -euo pipefail
+dest="/Users/forresthamilton/netsecpi-captures"
+mkdir -p "$dest"
+exec rsync -a -e ssh netsecpi:/home/kali/captures/ "$dest/"

@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec ssh -t netsecpi /home/kali/bin/kismet-run

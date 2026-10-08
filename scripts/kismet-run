@@ -1,0 +1,112 @@
+#!/bin/sh
+# Put usable Wi-Fi interfaces in monitor mode and start Kismet.
+# Does not change eth0, sshd, routes, or the firewall.
+set -eu
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+nm_present=0
+if command -v nmcli >/dev/null 2>&1; then
+  nm_present=1
+fi
+
+phy_supports_monitor() {
+  iw phy "$1" info | awk '
+    /Supported interface modes:/ { modes = 1; next }
+    modes && /^[[:space:]]*Band / { exit }
+    modes && /^[^[:space:]]/ { exit }
+    modes && $1 == "*" && $2 == "monitor" { found = 1 }
+    END { exit found ? 0 : 1 }
+  '
+}
+
+restore_one() {
+  iface="$1"
+  as_root ip link set "$iface" down || true
+  as_root iw dev "$iface" set type managed || true
+  as_root ip link set "$iface" up || true
+  if [ "$nm_present" -eq 1 ]; then
+    as_root nmcli device set "$iface" managed yes || true
+  fi
+}
+
+READY=""
+ifs_file=""
+
+cleanup() {
+  for iface in $READY; do
+    restore_one "$iface"
+  done
+  if [ -n "$ifs_file" ]; then
+    rm -f "$ifs_file"
+  fi
+}
+trap cleanup EXIT
+
+dir="/home/kali/captures/kismet/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$dir"
+
+ifs_file="$(mktemp)"
+iw dev | awk '
+  /^phy#/ {
+    phy = $0
+    sub(/^phy#/, "phy", phy)
+    sub(/[[:space:]].*/, "", phy)
+    next
+  }
+  $1 == "Interface" { print phy, $2 }
+' > "$ifs_file"
+
+set --
+while read -r phy iface; do
+  [ -n "${iface:-}" ] || continue
+  case "$iface" in
+    eth*|lo|docker*|br*|tailscale*|wg*|tun*|tap*)
+      log "skip $iface: not a wireless interface"
+      continue
+      ;;
+  esac
+  if ! phy_supports_monitor "$phy"; then
+    log "skip $iface: $phy does not advertise monitor mode"
+    continue
+  fi
+  if [ "$nm_present" -eq 1 ]; then
+    if ! as_root nmcli device set "$iface" managed no; then
+      log "skip $iface: could not stop NetworkManager from managing it"
+      continue
+    fi
+  fi
+  if ! as_root ip link set "$iface" down \
+    || ! as_root iw dev "$iface" set type monitor \
+    || ! as_root ip link set "$iface" up \
+    || ! iw dev "$iface" info | awk '/^[[:space:]]*type / && $2 == "monitor" { found = 1 } END { exit found ? 0 : 1 }'; then
+    log "skip $iface: could not set monitor mode"
+    restore_one "$iface"
+    continue
+  fi
+  READY="$READY $iface"
+  set -- "$@" -c "$iface"
+  log "monitor: $iface ($phy)"
+done < "$ifs_file"
+
+if [ -z "$READY" ]; then
+  log "error: no wireless interface could be put in monitor mode"
+  exit 1
+fi
+
+log "kismet --log-prefix $dir --log-types kismet,pcapng $*"
+set +e
+/usr/bin/kismet --log-prefix "$dir" --log-types kismet,pcapng "$@"
+status=$?
+set -e
+exit "$status"
